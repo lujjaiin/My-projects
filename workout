@@ -1,0 +1,205 @@
+// server.js - Backend with Express.js and SQLite
+const express = require('express');
+const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const sqlite3 = require('sqlite3').verbose();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const SECRET_KEY = "supersecretkey"; 
+
+const db = new sqlite3.Database('./fitness.db', (err) => {
+  if (err) console.error('Database error:', err.message);
+});
+
+// إنشاء الجداول
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE,
+    password TEXT
+  )`);
+  
+  db.run(`CREATE TABLE IF NOT EXISTS workouts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE,
+    calories_per_minute INTEGER
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS workout_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    workout_id INTEGER,
+    start_time DATETIME,
+    end_time DATETIME,
+    duration INTEGER,
+    calories_burned INTEGER,
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (workout_id) REFERENCES workouts(id)
+  )`);
+});
+
+
+db.run(`INSERT OR IGNORE INTO workouts (name, calories_per_minute) VALUES
+  ('Running', 10),
+  ('Cycling', 8),
+  ('Jump Rope', 12),
+  ('Yoga', 4)
+`);
+
+
+const authenticateToken = (req, res, next) => {
+  const token = req.headers['authorization'];
+  if (!token) return res.status(403).json({ message: 'Access denied' });
+
+  jwt.verify(token, SECRET_KEY, (err, user) => {
+    if (err) return res.status(403).json({ message: 'Invalid token' });
+    req.user = user;
+    next();
+  });
+};
+
+
+app.post('/register', async (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ message: "Missing fields" });
+
+  db.get('SELECT * FROM users WHERE username = ?', [username], async (err, user) => {
+    if (user) return res.status(400).json({ message: 'Username already exists' });
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    db.run('INSERT INTO users (username, password) VALUES (?, ?)', [username, hashedPassword], function (err) {
+      if (err) return res.status(500).json({ message: 'Error registering user' });
+      res.status(201).json({ message: 'User registered' });
+    });
+  });
+});
+
+
+app.post('/login', (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ message: "Missing fields" });
+
+  db.get('SELECT * FROM users WHERE username = ?', [username], async (err, user) => {
+    if (!user) return res.status(400).json({ message: 'User not found' });
+
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) return res.status(400).json({ message: 'Invalid credentials' });
+
+    const token = jwt.sign({ id: user.id }, SECRET_KEY, { expiresIn: '1h' });
+    res.json({ token });
+  });
+});
+app.get('/workouts', (req, res) => {
+  db.all('SELECT * FROM workouts', [], (err, workouts) => {
+    if (err) return res.status(500).json({ message: 'Error fetching workouts' });
+    res.json({ workouts });
+  });
+});
+
+
+app.post('/start-workout', authenticateToken, (req, res) => {
+  const { workoutId } = req.body;
+  const userId = req.user.id;
+  const startTime = new Date().toISOString();
+
+  db.run('INSERT INTO workout_sessions (user_id, workout_id, start_time) VALUES (?, ?, ?)',
+    [userId, workoutId, startTime], function (err) {
+      if (err) return res.status(400).json({ message: 'Error starting workout' });
+      res.json({ sessionId: this.lastID });
+  });
+});
+
+
+app.post('/end-workout', authenticateToken, (req, res) => {
+  const { sessionId } = req.body;
+  const endTime = new Date().toISOString();
+
+  db.get(`SELECT ws.start_time, w.calories_per_minute 
+          FROM workout_sessions ws 
+          JOIN workouts w ON ws.workout_id = w.id 
+          WHERE ws.id = ?`, [sessionId], (err, session) => {
+    if (!session) return res.status(400).json({ message: 'Session not found' });
+
+    const duration = Math.floor((new Date(endTime) - new Date(session.start_time)) / 60000);
+    const caloriesBurned = Math.round(duration * session.calories_per_minute);
+
+    db.run(`UPDATE workout_sessions SET end_time = ?, duration = ?, calories_burned = ? WHERE id = ?`,
+      [endTime, duration, caloriesBurned, sessionId], function (err) {
+        if (err) return res.status(400).json({ message: 'Error ending workout' });
+        res.json({ message: 'Workout ended', duration, caloriesBurned });
+    });
+  });
+});
+
+app.get('/user-progress', authenticateToken, (req, res) => {
+  const userId = req.user.id;
+
+  db.all(`SELECT w.name AS workout_name, COUNT(ws.id) AS total_sessions, 
+          AVG(ws.duration) AS avg_duration, SUM(ws.calories_burned) AS total_calories 
+          FROM workout_sessions ws 
+          JOIN workouts w ON ws.workout_id = w.id 
+          WHERE ws.user_id = ? GROUP BY ws.workout_id`, [userId], (err, rows) => {
+    if (err) return res.status(500).json({ message: 'Error retrieving progress' });
+    res.json({ progress: rows });
+  });
+});
+
+app.listen(8000, () => console.log('Server running on port 8000'));
+
+
+
+app.post("/end-workout", async (req, res) => {
+    const { sessionId } = req.body;
+    if (!sessionId) {
+      return res.status(400).json({ success: false, message: "Session ID is required" });
+    }
+  
+    try {
+      // تحديث وقت الانتهاء
+      const endTime = new Date().toISOString();
+      await db.run("UPDATE workout_sessions SET end_time = ? WHERE id = ?", [endTime, sessionId]);
+  
+      // جلب بيانات التمرين من قاعدة البيانات
+      const session = await db.get(`
+        SELECT w.start_time, w.exercise_id, e.duration AS required_duration, e.calories AS required_calories
+        FROM workout_sessions w
+        JOIN exercises e ON w.exercise_id = e.id
+        WHERE w.id = ?
+      `, [sessionId]);
+  
+      if (!session || !session.start_time) {
+        return res.status(404).json({ success: false, message: "Session not found or missing start time" });
+      }
+  
+      // حساب المدة الفعلية
+      const startTime = new Date(session.start_time);
+      const durationInSeconds = Math.round((new Date(endTime) - startTime) / 1000);
+  
+      // حساب السعرات المحروقة بناءً على المدة الفعلية
+      const burnRatio = durationInSeconds / session.required_duration; 
+      const burnedCalories = Math.round(session.required_calories * burnRatio);
+  
+      // التأكد من أن السعرات المحروقة لا تتجاوز الحد الأقصى
+      const finalBurnedCalories = Math.min(burnedCalories, session.required_calories);
+  
+      res.json({
+        success: true,
+        message: "Workout ended",
+        duration: durationInSeconds,
+        burnedCalories: finalBurnedCalories,
+        requiredCalories: session.required_calories
+      });
+  
+    } catch (error) {
+      console.error("Error updating session:", error);
+      res.status(500).json({ success: false, message: "Database error" });
+    }
+  });
+
+
+
+
